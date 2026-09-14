@@ -9,7 +9,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
+credentials.json
 # Build artifacts
 build/
 dist/
