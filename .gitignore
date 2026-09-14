@@ -1,1 +1,12 @@
-credentials.json
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts
+dist/
+build/
+*.parquet
+```
