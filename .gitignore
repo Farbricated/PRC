@@ -40,3 +40,8 @@ __pycache__/
 .Python
 *.so
 ```
+# Testing
+.pytest_cache/
+.mypy_cache/
+```
+credentials.json
