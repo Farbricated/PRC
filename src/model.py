@@ -1,4 +1,4 @@
-"""PRC 2026 Production Training and Prediction Pipeline."""
+"""PRC 2026 Production Training and Prediction Pipeline - Delta Formulation."""
 import glob, os, time, pandas as pd, numpy as np, lightgbm as lgb
 from sklearn.metrics import root_mean_squared_error
 from src.features import fit_categorical_types, build_features
@@ -10,60 +10,83 @@ def main():
     submit = pd.read_parquet("data/raw/submitting.parquet")
     dep_rank = rank[rank['MVT_ID_mvt'].isin(submit['MVT_ID_mvt'])].copy()
 
-    print("Loading all 12 training parquet files...", flush=True)
+    print("Loading training data with sampling for memory efficiency...", flush=True)
     train_files = sorted(glob.glob("data/raw/training_*.parquet"))
+    
+    # Only keep necessary columns (include all flight plan times for feature engineering)
+    needed_cols = ['ADEP_mvt', 'RUNWAY_mvt', 'STAND_mvt', 'AIRCRAFT_TYPE_mvt', 
+                   'WK_TBL_CAT_flt', 'AIRCRAFT_OPERATOR_flt', 'MVT_TIME_UTC_mvt',
+                   'BLOCK_TIME_UTC_mvt', 'AOBT_3_flt', 'TAXITIME_SEC_mvt', 'PHASE_mvt',
+                   'EOBT_1_flt', 'LOBT_flt', 'IOBT_flt', 'SCHED_TIME_UTC_mvt']
+    
+    # Sample training data to fit in memory (use ~40% of data)
     train_dfs = []
-    for f in train_files:
-        df = pd.read_parquet(f)
+    for i, f in enumerate(train_files):
+        df = pd.read_parquet(f, columns=needed_cols)
         dep = df[df.PHASE_mvt == 'DEP'].copy()
         dep = dep[dep['TAXITIME_SEC_mvt'].notna() & (dep['TAXITIME_SEC_mvt'] > 0)].copy()
-        train_dfs.append(dep)
+        # Sample 40% of each month's data
+        sampled = dep.sample(frac=0.4, random_state=42+i)
+        train_dfs.append(sampled)
+        print(f"  Loaded {i+1}/12 files ({len(sampled):,} rows)...", flush=True)
+    
     full_train = pd.concat(train_dfs, ignore_index=True)
-    print(f"Loaded {len(full_train):,} training departures in {time.time()-t0:.1f}s", flush=True)
+    print(f"Training on {len(full_train):,} sampled departures in {time.time()-t0:.1f}s", flush=True)
 
     # Build unified categorical types
     cat_types = fit_categorical_types(full_train, dep_rank)
 
     print("Building features for train and test...", flush=True)
     X_train = build_features(full_train, cat_types)
-    y_train = full_train['TAXITIME_SEC_mvt'].values
+    
+    # Target: delta = BLOCK_TIME - AOBT_3
+    y_train_delta = ((full_train['BLOCK_TIME_UTC_mvt'] - full_train['AOBT_3_flt']).dt.total_seconds()).values
+    
     X_test = build_features(dep_rank, cat_types)
 
-    # Train production model on normal taxi times
-    train_norm_mask = y_train < 7200
-    print(f"Training LightGBM on {train_norm_mask.sum():,} flights...", flush=True)
+    # Filter to valid delta values for training
+    has_aobt_train = X_train['has_aobt'].values == 1
+    valid_delta_mask = (y_train_delta >= -300) & (y_train_delta <= 1200) & has_aobt_train
+    print(f"Training LightGBM on {valid_delta_mask.sum():,} flights with valid delta...", flush=True)
+
     model = lgb.LGBMRegressor(
-        n_estimators=1000,
-        learning_rate=0.04,
-        num_leaves=127,
-        min_child_samples=50,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        n_estimators=600,
+        learning_rate=0.05,
+        num_leaves=47,
+        min_child_samples=100,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        reg_alpha=0.15,
+        reg_lambda=0.25,
         random_state=42,
         n_jobs=-1
     )
-    model.fit(X_train[train_norm_mask], y_train[train_norm_mask])
+    model.fit(X_train[valid_delta_mask], y_train_delta[valid_delta_mask])
 
     print("Generating predictions...", flush=True)
-    base_preds = model.predict(X_test)
-    final_preds = base_preds.copy()
+    pred_delta = model.predict(X_test)
 
+    # Bound delta predictions to realistic range [-3min, +12min]
+    pred_delta = np.clip(pred_delta, -180, 720)
+
+    # Calculate TAXITIME = diff_aobt - pred_delta
     test_diff_aobt = X_test['diff_aobt'].values
     test_has_aobt = X_test['has_aobt'].values == 1
 
-    # Rule 1: Flights with diff_aobt >= 7000 (multi-hour/24-hour outliers in ground truth)
+    final_preds = np.zeros(len(X_test))
+
+    # Rule 1: Flights with valid AOBT - use delta formulation
+    valid_aobt_mask = test_has_aobt & (test_diff_aobt > 0) & (test_diff_aobt < 7000)
+    final_preds[valid_aobt_mask] = test_diff_aobt[valid_aobt_mask] - pred_delta[valid_aobt_mask]
+
+    # Rule 2: Extreme outliers in ground truth (multi-hour taxi times)
     extreme_mask = test_has_aobt & (test_diff_aobt >= 7000.0)
     final_preds[extreme_mask] = test_diff_aobt[extreme_mask] - 60.0
 
-    # Rule 2: Flights with missing or invalid AOBT
+    # Rule 3: Missing or invalid AOBT - fall back to airport/time-based estimate
     invalid_aobt_mask = (~test_has_aobt) | (test_diff_aobt <= 0.0)
-    final_preds[invalid_aobt_mask] = np.clip(final_preds[invalid_aobt_mask], 300.0, 2800.0)
-
-    # Rule 3: Normal flights with valid AOBT
-    normal_aobt_mask = test_has_aobt & (test_diff_aobt > 0.0) & (test_diff_aobt < 7000.0)
-    lower_bound = np.maximum(60.0, test_diff_aobt[normal_aobt_mask] - 600.0)
-    upper_bound = np.minimum(5400.0, test_diff_aobt[normal_aobt_mask] + 1200.0)
-    final_preds[normal_aobt_mask] = np.clip(final_preds[normal_aobt_mask], lower_bound, upper_bound)
+    fallback_delta = pred_delta[invalid_aobt_mask]
+    final_preds[invalid_aobt_mask] = np.clip(850 + fallback_delta * 0.2, 300, 2200)
 
     final_preds = np.clip(final_preds, 60.0, 90000.0)
     dep_rank['pred_taxitime'] = final_preds
