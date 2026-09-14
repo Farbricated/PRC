@@ -1,24 +1,45 @@
 ```
-# Python
-__pycache__/
+# Compiled and build artifacts
+*.parquet
 *.pyc
-*.pyo
-*.pyd
+*.o
+*.obj
+dist/
+build/
+
+# Dependencies
+.venv/
+venv/
+node_modules/
+__pycache__/
 
 # Logs and temp files
 *.log
 *.tmp
+*.swp
 
 # Environment
 .env
 .env.local
-*.env.*
+.env.*
+
+# Editors
+.vscode/
+.idea/
 
 # Coverage
 .coverage
 coverage/
 htmlcov/
 
+# Python specific
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+```
 # Testing
 .pytest_cache/
 .mypy_cache/
